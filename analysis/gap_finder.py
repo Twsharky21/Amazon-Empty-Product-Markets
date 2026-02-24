@@ -3,11 +3,22 @@ Gap Finder — Identifies underserved niches by analyzing what's missing.
 
 Builds cross-reference matrices (puzzle_type × theme, puzzle_type × audience,
 theme × audience) and flags empty cells as potential opportunities. Ranks
-opportunities based on demand signals from related queries.
+opportunities using geometric-mean scoring that requires BOTH dimensions
+to have meaningful demand.
+
+Scoring approach:
+    Old: score = row_total + col_total  (biased toward big rows like word search)
+    New: score = sqrt(row_total * col_total) * fill_rate_bonus
+
+    This ensures a gap only ranks high when BOTH the puzzle type AND the
+    theme/audience have proven demand. A gap in "word search × cars" will
+    score low because "cars" has almost no demand, even though word search
+    is huge.
 """
 
 import json
 import logging
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -53,29 +64,73 @@ def _build_matrix(
     return df
 
 
-def _find_gaps(matrix: pd.DataFrame) -> list[dict]:
+def _find_gaps(matrix: pd.DataFrame, min_row_total: int = 3, min_col_total: int = 3) -> list[dict]:
     """
     Find empty cells in a matrix and score them as opportunities.
 
-    Score = (row_total + col_total) — higher means more demand in
-    related areas, so the gap is more interesting.
+    Score = sqrt(row_total * col_total) * fill_rate_bonus
+
+    This geometric mean ensures BOTH dimensions must have demand.
+    The fill_rate_bonus rewards gaps where the column appears in many
+    other rows (proven cross-market appeal).
+
+    Args:
+        matrix: Count matrix with puzzle types as rows, themes/audiences as cols.
+        min_row_total: Minimum row total to consider (filters dead rows).
+        min_col_total: Minimum col total to consider (filters dead columns).
     """
     row_totals = matrix.sum(axis=1)
     col_totals = matrix.sum(axis=0)
+
+    # How many rows have non-zero values for each column
+    col_fill_counts = (matrix > 0).sum(axis=0)
+    total_rows = len(matrix.index)
+
     gaps = []
 
     for row in matrix.index:
+        rt = int(row_totals.get(row, 0))
+        if rt < min_row_total:
+            continue
+
         for col in matrix.columns:
-            if matrix.at[row, col] == 0:
-                score = int(row_totals.get(row, 0) + col_totals.get(col, 0))
-                if score > 0:  # Only flag gaps where there IS some related demand
-                    gaps.append({
-                        "row": row,
-                        "column": col,
-                        "score": score,
-                        "row_total": int(row_totals.get(row, 0)),
-                        "col_total": int(col_totals.get(col, 0)),
-                    })
+            if matrix.at[row, col] != 0:
+                continue  # Not a gap
+
+            ct = int(col_totals.get(col, 0))
+            if ct < min_col_total:
+                continue
+
+            # Geometric mean: requires both dimensions to have demand
+            base_score = math.sqrt(rt * ct)
+
+            # Fill rate bonus: how many OTHER rows have this column?
+            # If 10 out of 22 puzzle types have "christmas", that's strong
+            # cross-market validation
+            fill_count = int(col_fill_counts.get(col, 0))
+            fill_rate = fill_count / total_rows if total_rows > 0 else 0
+            fill_bonus = 1.0 + fill_rate  # ranges from 1.0 to 2.0
+
+            score = base_score * fill_bonus
+
+            # Confidence tier based on data strength
+            if rt >= 50 and ct >= 20 and fill_count >= 5:
+                confidence = "high"
+            elif rt >= 20 and ct >= 10 and fill_count >= 3:
+                confidence = "medium"
+            else:
+                confidence = "low"
+
+            gaps.append({
+                "row": row,
+                "column": col,
+                "score": round(score, 1),
+                "row_total": rt,
+                "col_total": ct,
+                "col_fill_count": fill_count,
+                "col_fill_rate": round(fill_rate, 2),
+                "confidence": confidence,
+            })
 
     gaps.sort(key=lambda x: x["score"], reverse=True)
     return gaps

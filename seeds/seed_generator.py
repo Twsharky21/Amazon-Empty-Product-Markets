@@ -1,25 +1,34 @@
 """
-Seed Generator — Produces all base query combinations for Amazon autocomplete.
+Seed Generator — Produces prioritized query seeds for Amazon autocomplete.
 
-Builds queries from combinations of puzzle types, audiences, themes, modifiers,
-and age ranges using predefined templates.
+Strategy: Start with short, broad queries that Amazon actually has autocomplete
+data for, then let the scraper's recursive branching discover specific niches.
+
+Key design decisions:
+    - Puzzle types ordered by popularity (high-volume types first)
+    - Short 2-3 word seeds that match real search behavior
+    - No 3+ component combos (let autocomplete discover those)
+    - ~800-1200 total seeds instead of 48K+ (quality over quantity)
 """
 
 import logging
-from itertools import product as iterproduct
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Component Lists
+# Component Lists (ordered by estimated search volume)
 # ---------------------------------------------------------------------------
 
 PUZZLE_TYPES = [
-    "word search", "crossword", "sudoku", "cryptogram", "maze",
-    "word scramble", "number search", "logic puzzle", "word find",
-    "brain teaser", "dot to dot", "hidden word", "acrostic", "kakuro",
-    "kenken", "nonogram", "picture puzzle", "rebus puzzle", "trivia",
-    "riddle book", "activity book", "puzzle book",
+    # High volume — these are the big sellers on KDP
+    "word search", "crossword", "sudoku", "maze", "activity book",
+    "puzzle book", "word find", "brain teaser", "trivia",
+    # Medium volume
+    "dot to dot", "word scramble", "cryptogram", "number search",
+    "logic puzzle", "hidden word", "riddle book",
+    # Niche / lower volume
+    "acrostic", "kakuro", "kenken", "nonogram", "picture puzzle",
+    "rebus puzzle",
 ]
 
 AUDIENCES = [
@@ -52,70 +61,116 @@ AGE_RANGES = [
     "ages 8-12", "ages 9-12", "ages 10-14",
 ]
 
+# Top themes/audiences/modifiers to pair with puzzle types.
+# We don't need every combo — just enough to prime the autocomplete.
+TOP_AUDIENCES = ["kids", "adults", "seniors", "teens", "women", "men"]
+TOP_THEMES = [
+    "animals", "bible", "sports", "christmas", "halloween", "disney",
+    "nature", "travel", "dogs", "cats", "space", "dinosaurs", "food",
+    "history", "science",
+]
+TOP_MODIFIERS = ["large print", "easy", "hard"]
+
 
 def generate_seeds() -> list[str]:
     """
-    Generate all seed queries from component combinations.
+    Generate prioritized seed queries for Amazon autocomplete scraping.
 
-    Templates:
-        1.  "{puzzle_type} book"
-        2.  "{puzzle_type} book for {audience}"
-        3.  "{puzzle_type} book for {audience} {modifier}"
-        4.  "{puzzle_type} book about {theme}"
-        5.  "{puzzle_type} book {theme}"
-        6.  "{puzzle_type} book {modifier}"
-        7.  "{puzzle_type} for {audience} {theme}"
-        8.  "{puzzle_type} {theme} for {audience}"
-        9.  "{puzzle_type} book for {age_range}"
-        10. "{puzzle_type} {modifier}"
+    Tier 1 — Bare puzzle types (highest value, always return results):
+        "{puzzle_type}"
+        "{puzzle_type} book"
+        "{puzzle_type} books"
+        "{puzzle_type} puzzle book"
 
-    Returns a deduplicated, sorted list of query strings.
+    Tier 2 — Puzzle + audience (high value):
+        "{puzzle_type} for {audience}"
+        "{puzzle_type} book for {audience}"
+
+    Tier 3 — Puzzle + top theme (medium value):
+        "{puzzle_type} {theme}"
+
+    Tier 4 — Puzzle + top modifier (medium value):
+        "{puzzle_type} {modifier}"
+        "{puzzle_type} book {modifier}"
+
+    Tier 5 — Puzzle + age range:
+        "{puzzle_type} for {age_range}"
+        "{puzzle_type} book for {age_range}"
+
+    Tier 6 — Audience + theme combos (no puzzle type, discovers cross-cutting):
+        "{audience} puzzle book"
+        "{theme} puzzle book"
+
+    Returns a deduplicated list ordered by tier priority.
     """
-    seeds: set[str] = set()
+    # Use a list to preserve priority order, dedup at the end
+    ordered_seeds: list[str] = []
+    seen: set[str] = set()
 
+    def _add(query: str) -> None:
+        q = query.strip().lower()
+        if q and q not in seen:
+            seen.add(q)
+            ordered_seeds.append(q)
+
+    # --- Tier 1: Bare puzzle types ---
     for pt in PUZZLE_TYPES:
-        # Template 1
-        seeds.add(f"{pt} book")
+        _add(pt)
+        if "book" not in pt:
+            _add(f"{pt} book")
+            _add(f"{pt} books")
+            _add(f"{pt} puzzle book")
+        else:
+            # Already contains "book" (e.g., "puzzle book", "activity book")
+            _add(f"{pt}s")  # plural
 
-        for aud in AUDIENCES:
-            # Template 2
-            seeds.add(f"{pt} book for {aud}")
-            for mod in MODIFIERS:
-                # Template 3
-                seeds.add(f"{pt} book for {aud} {mod}")
+    # --- Tier 2: Puzzle + audience ---
+    for pt in PUZZLE_TYPES:
+        for aud in TOP_AUDIENCES:
+            _add(f"{pt} for {aud}")
+            if "book" not in pt:
+                _add(f"{pt} book for {aud}")
 
-        for theme in THEMES:
-            # Template 4
-            seeds.add(f"{pt} book about {theme}")
-            # Template 5
-            seeds.add(f"{pt} book {theme}")
+    # --- Tier 3: Puzzle + top themes ---
+    for pt in PUZZLE_TYPES:
+        for theme in TOP_THEMES:
+            _add(f"{pt} {theme}")
 
-        for mod in MODIFIERS:
-            # Template 6
-            seeds.add(f"{pt} book {mod}")
-            # Template 10
-            seeds.add(f"{pt} {mod}")
+    # --- Tier 4: Puzzle + top modifiers ---
+    for pt in PUZZLE_TYPES:
+        for mod in TOP_MODIFIERS:
+            _add(f"{pt} {mod}")
+            if "book" not in pt:
+                _add(f"{pt} book {mod}")
 
-        for aud in AUDIENCES:
-            for theme in THEMES:
-                # Template 7
-                seeds.add(f"{pt} for {aud} {theme}")
-                # Template 8
-                seeds.add(f"{pt} {theme} for {aud}")
-
+    # --- Tier 5: Puzzle + age ranges ---
+    for pt in PUZZLE_TYPES:
         for age in AGE_RANGES:
-            # Template 9
-            seeds.add(f"{pt} book for {age}")
+            _add(f"{pt} for {age}")
+            if "book" not in pt:
+                _add(f"{pt} book for {age}")
 
-    result = sorted(seeds)
-    logger.info("Generated %d unique seed queries", len(result))
-    return result
+    # --- Tier 6: Cross-cutting discovery ---
+    for aud in AUDIENCES:
+        _add(f"{aud} puzzle book")
+        _add(f"puzzle book for {aud}")
+    for theme in TOP_THEMES:
+        _add(f"{theme} puzzle book")
+        _add(f"{theme} activity book")
+        _add(f"{theme} word search")
+
+    logger.info("Generated %d unique seed queries", len(ordered_seeds))
+    return ordered_seeds
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     seeds = generate_seeds()
     print(f"Total seeds: {len(seeds)}")
-    for s in seeds[:20]:
+    print("\nFirst 30:")
+    for s in seeds[:30]:
         print(f"  {s}")
-    print("  ...")
+    print("\n...")
+    print(f"\nLast 10:")
+    for s in seeds[-10:]:
+        print(f"  {s}")
